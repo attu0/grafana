@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/grafana/alerting/definition"
+	alertingModels "github.com/grafana/alerting/models"
 	alertingNotify "github.com/grafana/alerting/notify"
 	"github.com/grafana/alerting/receivers/schema"
 
@@ -19,6 +21,8 @@ import (
 	"github.com/grafana/grafana/pkg/services/ngalert/models"
 	"github.com/grafana/grafana/pkg/services/ngalert/notifier"
 	"github.com/grafana/grafana/pkg/services/ngalert/notifier/legacy_storage"
+	v1 "github.com/grafana/grafana/pkg/services/ngalert/notifier/legacy_storage/v1"
+	"github.com/grafana/grafana/pkg/services/ngalert/provisioning/validation"
 	"github.com/grafana/grafana/pkg/services/ngalert/store"
 	"github.com/grafana/grafana/pkg/services/secrets"
 	"github.com/grafana/grafana/pkg/util"
@@ -27,11 +31,12 @@ import (
 // ErrUserRequired is returned when a nil user is passed to protected field authorization checks.
 var ErrUserRequired = errors.New("user is required to check protected field authorization")
 
-// ProtectedFieldsAuthz defines the interface for checking protected field authorization.
-// This is implemented by receiver access control services.
-type ProtectedFieldsAuthz interface {
+type receiverAuthz interface {
 	HasUpdateProtected(ctx context.Context, user identity.Requester, receiver *models.Receiver) (bool, error)
 	AuthorizeUpdateProtected(ctx context.Context, user identity.Requester, receiver *models.Receiver) error
+	AuthorizeCreate(context.Context, identity.Requester) error
+	AuthorizeUpdateByUID(context.Context, identity.Requester, string) error
+	AuthorizeDeleteByUID(context.Context, identity.Requester, string) error
 }
 
 type AlertRuleNotificationSettingsStore interface {
@@ -40,16 +45,22 @@ type AlertRuleNotificationSettingsStore interface {
 	ListContactPointRoutings(ctx context.Context, q models.ListContactPointRoutingsQuery) (map[models.AlertRuleKey]models.ContactPointRouting, error)
 }
 
+type emailIntegrationValidator interface {
+	ValidateIntegrationConfig(ctx context.Context, orgID int64, integration alertingModels.IntegrationConfig, logger log.Logger) error
+}
+
 type ContactPointService struct {
-	authz                     ProtectedFieldsAuthz
+	authz                     receiverAuthz
 	configStore               alertmanagerConfigStore
-	encryptionService         secrets.Service
+	encryptionService         secrets.Service //nolint:staticcheck // SA1019: Legacy envelope encryption for single-tenant feature
 	provenanceStore           ProvisioningStore
 	notificationSettingsStore AlertRuleNotificationSettingsStore
 	xact                      TransactionManager
 	receiverService           receiverService
 	log                       log.Logger
 	resourcePermissions       ac.ReceiverPermissionsService
+	allowedIntegrations       map[schema.IntegrationType]struct{}
+	emailValidator            emailIntegrationValidator
 }
 
 type receiverService interface {
@@ -59,15 +70,17 @@ type receiverService interface {
 }
 
 func NewContactPointService(
-	authz ProtectedFieldsAuthz,
+	authz receiverAuthz,
 	store alertmanagerConfigStore,
-	encryptionService secrets.Service,
+	encryptionService secrets.Service, //nolint:staticcheck // SA1019: Legacy envelope encryption for single-tenant feature
 	provenanceStore ProvisioningStore,
 	xact TransactionManager,
 	receiverService receiverService,
 	log log.Logger,
 	nsStore AlertRuleNotificationSettingsStore,
 	resourcePermissions ac.ReceiverPermissionsService,
+	allowedIntegrations map[schema.IntegrationType]struct{},
+	emailValidator emailIntegrationValidator,
 ) *ContactPointService {
 	return &ContactPointService{
 		authz:                     authz,
@@ -79,6 +92,8 @@ func NewContactPointService(
 		log:                       log,
 		notificationSettingsStore: nsStore,
 		resourcePermissions:       resourcePermissions,
+		allowedIntegrations:       allowedIntegrations,
+		emailValidator:            emailValidator,
 	}
 }
 
@@ -146,7 +161,7 @@ func (ecp *ContactPointService) getContactPointDecrypted(ctx context.Context, or
 			continue
 		}
 		embeddedContactPoint, err := PostableGrafanaReceiverToEmbeddedContactPoint(
-			receiver,
+			new(definition.PostableGrafanaReceiver(*receiver)),
 			models.ProvenanceNone, // TODO should be correct provenance?
 			ecp.decryptValueOrRedacted(true, receiver.UID),
 		)
@@ -165,7 +180,7 @@ func (ecp *ContactPointService) CreateContactPoint(
 	contactPoint apimodels.EmbeddedContactPoint,
 	provenance models.Provenance,
 ) (apimodels.EmbeddedContactPoint, error) {
-	if err := ValidateContactPoint(ctx, &contactPoint, ecp.encryptionService.GetDecryptedValue); err != nil {
+	if err := ecp.validateContactPoint(ctx, orgID, &contactPoint); err != nil {
 		return apimodels.EmbeddedContactPoint{}, fmt.Errorf("%w: %s", ErrValidation, err.Error())
 	}
 
@@ -198,10 +213,11 @@ func (ecp *ContactPointService) CreateContactPoint(
 		return apimodels.EmbeddedContactPoint{}, err
 	}
 
-	grafanaReceiver := &apimodels.PostableGrafanaReceiver{
+	grafanaReceiver := &v1.PostableGrafanaReceiver{
 		UID:                   contactPoint.UID,
 		Name:                  contactPoint.Name,
 		Type:                  contactPoint.Type,
+		Version:               string(schema.V1),
 		DisableResolveMessage: contactPoint.DisableResolveMessage,
 		Settings:              jsonData,
 		SecureSettings:        extractedSecrets,
@@ -218,16 +234,22 @@ func (ecp *ContactPointService) CreateContactPoint(
 		if receiver.Name == contactPoint.Name {
 			receiver.GrafanaManagedReceivers = append(receiver.GrafanaManagedReceivers, grafanaReceiver)
 			receiverFound = true
+			if err := ecp.authz.AuthorizeUpdateByUID(ctx, user, models.NameToUid(receiver.Name)); err != nil {
+				return apimodels.EmbeddedContactPoint{}, err
+			}
 		}
 	}
 
 	if !receiverFound {
-		revision.Config.AlertmanagerConfig.Receivers = append(revision.Config.AlertmanagerConfig.Receivers, &apimodels.PostableApiReceiver{
+		if err := ecp.authz.AuthorizeCreate(ctx, user); err != nil {
+			return apimodels.EmbeddedContactPoint{}, err
+		}
+		revision.Config.AlertmanagerConfig.Receivers = append(revision.Config.AlertmanagerConfig.Receivers, &v1.PostableApiReceiver{
 			Receiver: apimodels.Receiver{
 				Name: grafanaReceiver.Name,
 			},
-			PostableGrafanaReceivers: apimodels.PostableGrafanaReceivers{
-				GrafanaManagedReceivers: []*apimodels.PostableGrafanaReceiver{grafanaReceiver},
+			PostableGrafanaReceivers: v1.PostableGrafanaReceivers{
+				GrafanaManagedReceivers: []*v1.PostableGrafanaReceiver{grafanaReceiver},
 			},
 		})
 	}
@@ -280,7 +302,7 @@ func (ecp *ContactPointService) UpdateContactPoint(ctx context.Context, orgID in
 	}
 
 	// validate merged values
-	if err := ValidateContactPoint(ctx, &contactPoint, ecp.encryptionService.GetDecryptedValue); err != nil {
+	if err := ecp.validateContactPoint(ctx, orgID, &contactPoint); err != nil {
 		return fmt.Errorf("%w: %s", ErrValidation, err.Error())
 	}
 
@@ -290,7 +312,7 @@ func (ecp *ContactPointService) UpdateContactPoint(ctx context.Context, orgID in
 		return err
 	}
 	if storedProvenance != provenance && storedProvenance != models.ProvenanceNone {
-		return fmt.Errorf("cannot change provenance from '%s' to '%s'", storedProvenance, provenance)
+		return validation.MakeErrProvenanceChangeNotAllowed(storedProvenance, provenance)
 	}
 
 	// Check protected fields authorization
@@ -314,10 +336,11 @@ func (ecp *ContactPointService) UpdateContactPoint(ctx context.Context, orgID in
 	if err != nil {
 		return err
 	}
-	mergedReceiver := &apimodels.PostableGrafanaReceiver{
+	mergedReceiver := &v1.PostableGrafanaReceiver{
 		UID:                   contactPoint.UID,
 		Name:                  contactPoint.Name,
 		Type:                  contactPoint.Type,
+		Version:               string(schema.V1),
 		DisableResolveMessage: contactPoint.DisableResolveMessage,
 		Settings:              jsonData,
 		SecureSettings:        extractedSecrets,
@@ -333,6 +356,10 @@ func (ecp *ContactPointService) UpdateContactPoint(ctx context.Context, orgID in
 		return fmt.Errorf("%w: contact point with uid '%s' not found", ErrNotFound, mergedReceiver.UID)
 	}
 	oldReceiverName := *oldReceiverNameRef
+
+	if err := ecp.authorizeUpdate(ctx, user, mergedReceiver.Name, oldReceiverName, fullRemoval, newReceiverCreated); err != nil {
+		return err
+	}
 
 	err = ecp.xact.InTransaction(ctx, func(ctx context.Context) error {
 		if mergedReceiver.Name != oldReceiverName && oldReceiverName != "" {
@@ -367,7 +394,31 @@ func (ecp *ContactPointService) UpdateContactPoint(ctx context.Context, orgID in
 	return nil
 }
 
-func (ecp *ContactPointService) DeleteContactPoint(ctx context.Context, orgID int64, uid string) error {
+// authorizeUpdate checks authorization for a contact point update, handling the
+// different cases: simple update, rename into existing receiver, and rename creating a new receiver.
+func (ecp *ContactPointService) authorizeUpdate(ctx context.Context, user identity.Requester, newName, oldName string, fullRemoval, newReceiverCreated bool) error {
+	renamed := newName != oldName && oldName != ""
+	if !renamed {
+		return ecp.authz.AuthorizeUpdateByUID(ctx, user, models.NameToUid(newName))
+	}
+
+	// Authorize the target: create if it's a new receiver group, update otherwise.
+	if newReceiverCreated {
+		if err := ecp.authz.AuthorizeCreate(ctx, user); err != nil {
+			return err
+		}
+	} else if err := ecp.authz.AuthorizeUpdateByUID(ctx, user, models.NameToUid(newName)); err != nil {
+		return err
+	}
+
+	// Authorize the source: delete if fully removed, update otherwise.
+	if fullRemoval {
+		return ecp.authz.AuthorizeDeleteByUID(ctx, user, models.NameToUid(oldName))
+	}
+	return ecp.authz.AuthorizeUpdateByUID(ctx, user, models.NameToUid(oldName))
+}
+
+func (ecp *ContactPointService) DeleteContactPoint(ctx context.Context, orgID int64, user identity.Requester, uid string) error {
 	revision, err := ecp.configStore.Get(ctx, orgID)
 	if err != nil {
 		return err
@@ -395,6 +446,16 @@ func (ecp *ContactPointService) DeleteContactPoint(ctx context.Context, orgID in
 	}
 	if fullRemoval && name != "" && ecp.receiverService.ReceiverNameUsedByRoutes(ctx, revision, name) {
 		return ErrContactPointReferenced.Errorf("")
+	}
+
+	if fullRemoval {
+		if err := ecp.authz.AuthorizeDeleteByUID(ctx, user, models.NameToUid(name)); err != nil {
+			return err
+		}
+	} else {
+		if err := ecp.authz.AuthorizeUpdateByUID(ctx, user, models.NameToUid(name)); err != nil {
+			return err
+		}
 	}
 
 	return ecp.xact.InTransaction(ctx, func(ctx context.Context) error {
@@ -518,7 +579,7 @@ func (ecp *ContactPointService) checkProtectedFields(
 // stitchReceiver modifies a receiver, target, in an alertmanager configStore. It modifies the given configStore in-place.
 // Returns true if the configStore was altered in any way, and false otherwise.
 // If integration was moved to another group and it was the last in the previous group, the second parameter contains the name of the old group that is gone
-func stitchReceiver(cfg *apimodels.PostableUserConfig, target *apimodels.PostableGrafanaReceiver) (oldReceiverName *string, fullRemoval bool, newReceiverCreated bool) {
+func stitchReceiver(cfg *v1.AMConfigV1, target *v1.PostableGrafanaReceiver) (oldReceiverName *string, fullRemoval bool, newReceiverCreated bool) {
 	// Algorithm to fix up receivers. Receivers are very complex and depend heavily on internal consistency.
 	// All receivers in a given receiver group have the same name. We must maintain this across renames.
 groupLoop:
@@ -573,12 +634,12 @@ groupLoop:
 				}
 
 				// Doesn't exist? Create a new group just for the receiver.
-				newGroup := &apimodels.PostableApiReceiver{
+				newGroup := &v1.PostableApiReceiver{
 					Receiver: apimodels.Receiver{
 						Name: target.Name,
 					},
-					PostableGrafanaReceivers: apimodels.PostableGrafanaReceivers{
-						GrafanaManagedReceivers: []*apimodels.PostableGrafanaReceiver{
+					PostableGrafanaReceivers: v1.PostableGrafanaReceivers{
+						GrafanaManagedReceivers: []*v1.PostableGrafanaReceiver{
 							target,
 						},
 					},
@@ -594,7 +655,21 @@ groupLoop:
 	return oldReceiverName, fullRemoval, newReceiverCreated
 }
 
-func ValidateContactPoint(ctx context.Context, e *apimodels.EmbeddedContactPoint, decryptFunc alertingNotify.GetDecryptedValueFn) error {
+func (ecp *ContactPointService) validateContactPoint(ctx context.Context, orgID int64, e *apimodels.EmbeddedContactPoint) error {
+	if err := ValidateContactPoint(ctx, e, ecp.encryptionService.GetDecryptedValue, ecp.allowedIntegrations); err != nil {
+		return err
+	}
+	if e.Type != string(schema.EmailType) {
+		return nil
+	}
+	integration, err := EmbeddedContactPointToGrafanaIntegrationConfig(e)
+	if err != nil {
+		return err
+	}
+	return ecp.emailValidator.ValidateIntegrationConfig(ctx, orgID, integration, ecp.log.FromContext(ctx))
+}
+
+func ValidateContactPoint(ctx context.Context, e *apimodels.EmbeddedContactPoint, decryptFunc alertingNotify.GetDecryptedValueFn, allowedIntegrations map[schema.IntegrationType]struct{}) error {
 	if e.Name == "" {
 		return errors.New("name is required")
 	}
@@ -602,12 +677,54 @@ func ValidateContactPoint(ctx context.Context, e *apimodels.EmbeddedContactPoint
 	if err != nil {
 		return err
 	}
+	if allowedIntegrations != nil {
+		if _, allowed := allowedIntegrations[iType]; !allowed {
+			return fmt.Errorf("integration type %s is not allowed", iType)
+		}
+	}
 	e.Type = string(iType)
+	if err := validateSecretFields(e); err != nil {
+		return err
+	}
 	integration, err := EmbeddedContactPointToGrafanaIntegrationConfig(e)
 	if err != nil {
 		return err
 	}
 	return models.ValidateIntegration(ctx, integration, decryptFunc)
+}
+
+// validateSecretFields rejects duplicate keys that differ only by case in secret fields to avoid ambiguity in secret redaction
+func validateSecretFields(e *apimodels.EmbeddedContactPoint) error {
+	typeSchema, ok := alertingNotify.GetSchemaVersionForIntegration(schema.IntegrationType(e.Type), schema.V1)
+	if !ok {
+		return fmt.Errorf("failed to get schema for contact point type %s", e.Type)
+	}
+	for _, secretPath := range typeSchema.GetSecretFieldsPaths() {
+		node := e.Settings
+		for _, segment := range secretPath {
+			if node == nil {
+				break
+			}
+			m, err := node.Map()
+			if err != nil {
+				break
+			}
+			var matches []string
+			for k := range m {
+				if strings.EqualFold(k, segment) {
+					matches = append(matches, k)
+				}
+			}
+			if len(matches) == 0 {
+				break
+			}
+			if len(matches) > 1 {
+				return fmt.Errorf("duplicate keys found for secret field %s", secretPath.String())
+			}
+			node = node.Get(matches[0])
+		}
+	}
+	return nil
 }
 
 // RemoveSecretsForContactPoint removes all secrets from the contact point's settings and returns them as a map. Returns error if contact point type is not known.
@@ -660,7 +777,7 @@ func extractCaseInsensitive(jsonObj *simplejson.Json, key string) (string, error
 
 	node := jsonObj
 	for idx, segment := range path {
-		_, value, err := getNodeCaseInsensitive(node, segment)
+		k, value, err := getNodeCaseInsensitive(node, segment)
 		if err != nil {
 			return "", err
 		}
@@ -669,7 +786,7 @@ func extractCaseInsensitive(jsonObj *simplejson.Json, key string) (string, error
 		}
 		if idx == len(path)-1 {
 			resultValue := value.MustString()
-			node.Del(segment)
+			node.Del(k)
 			return resultValue, nil
 		}
 		node = value
