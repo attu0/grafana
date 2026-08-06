@@ -360,6 +360,11 @@
      },
      "type": "array"
     },
+    "policy": {
+     "description": "Name of the notification policy to route alerts through.\nMutually exclusive with all other fields, cannot be used with contact point routing via the \"receiver\" field.\nRequires experimental feature flag: alertingMultiplePolicies",
+     "example": "\"Alerting Team\"",
+     "type": "string"
+    },
     "receiver": {
      "description": "Name of the receiver to send notifications to.",
      "example": "grafana-default-email",
@@ -750,39 +755,54 @@
   },
   "Config": {
    "properties": {
-    "global": {
-     "$ref": "#/definitions/GlobalConfig"
+    "api_url": {
+     "$ref": "#/definitions/URL"
     },
-    "inhibit_rules": {
-     "items": {
-      "$ref": "#/definitions/InhibitRule"
-     },
-     "type": "array"
+    "custom_fields": {
+     "additionalProperties": {},
+     "type": "object"
     },
-    "mute_time_intervals": {
-     "description": "MuteTimeIntervals is deprecated and will be removed before Alertmanager 1.0.",
-     "items": {
-      "$ref": "#/definitions/MuteTimeInterval"
-     },
-     "type": "array"
+    "description": {
+     "type": "string"
     },
-    "route": {
-     "$ref": "#/definitions/Route"
+    "http_config": {
+     "$ref": "#/definitions/HTTPClientConfig"
     },
-    "templates": {
+    "issue_type": {
+     "type": "string"
+    },
+    "labels": {
      "items": {
       "type": "string"
      },
      "type": "array"
     },
-    "time_intervals": {
-     "items": {
-      "$ref": "#/definitions/TimeInterval"
-     },
-     "type": "array"
+    "priority": {
+     "type": "string"
+    },
+    "project": {
+     "type": "string"
+    },
+    "reopen_duration": {
+     "$ref": "#/definitions/Duration"
+    },
+    "reopen_transition": {
+     "type": "string"
+    },
+    "resolve_transition": {
+     "type": "string"
+    },
+    "send_resolved": {
+     "type": "boolean"
+    },
+    "summary": {
+     "type": "string"
+    },
+    "wont_fix_resolution": {
+     "type": "string"
     }
    },
-   "title": "Config is the top-level configuration for Alertmanager's config files.",
+   "title": "Config configures notifications via JIRA.",
    "type": "object"
   },
   "ContactPointExport": {
@@ -2063,7 +2083,7 @@
      "$ref": "#/definitions/Secret"
     },
     "bearer_token_file": {
-     "description": "The bearer token file for the targets. Deprecated in favour of\nAuthorization.CredentialsFile.",
+     "description": "The bearer token file for the targets. Deprecated in favour of\nAuthorization.CredentialsFile.now",
      "type": "string"
     },
     "enable_http2": {
@@ -2126,6 +2146,9 @@
    "type": "object"
   },
   "Headers": {
+   "additionalProperties": {
+    "$ref": "#/definitions/Header"
+   },
    "properties": {
     "Headers": {
      "additionalProperties": {
@@ -2662,31 +2685,6 @@
   },
   "OAuth2": {
    "properties": {
-    "TLSConfig": {
-     "$ref": "#/definitions/TLSConfig"
-    },
-    "audience": {
-     "description": "Audience optionally specifies the intended audience of the\nrequest.  If empty, the value of TokenURL is used as the\nintended audience. Only used if\nGrantType is set to \"urn:ietf:params:oauth:grant-type:jwt-bearer\".",
-     "type": "string"
-    },
-    "claims": {
-     "additionalProperties": {},
-     "description": "Claims is a map of claims to be added to the JWT token. Only used if\nGrantType is set to \"urn:ietf:params:oauth:grant-type:jwt-bearer\".",
-     "type": "object"
-    },
-    "client_certificate_key": {
-     "$ref": "#/definitions/Secret"
-    },
-    "client_certificate_key_file": {
-     "type": "string"
-    },
-    "client_certificate_key_id": {
-     "type": "string"
-    },
-    "client_certificate_key_ref": {
-     "description": "ClientCertificateKeyRef is the name of the secret within the secret manager to use as the client\nsecret.",
-     "type": "string"
-    },
     "client_id": {
      "type": "string"
     },
@@ -2705,14 +2703,6 @@
       "type": "string"
      },
      "type": "object"
-    },
-    "grant_type": {
-     "description": "GrantType is the OAuth2 grant type to use. It can be one of\n\"client_credentials\" or \"urn:ietf:params:oauth:grant-type:jwt-bearer\" (RFC 7523).\nDefault value is \"client_credentials\"",
-     "type": "string"
-    },
-    "iss": {
-     "description": "Iss is the OAuth client identifier used when communicating with\nthe configured OAuth provider. Default value is client_id. Only used if\nGrantType is set to \"urn:ietf:params:oauth:grant-type:jwt-bearer\".",
-     "type": "string"
     },
     "no_proxy": {
      "description": "NoProxy contains addresses that should not use a proxy.",
@@ -2734,9 +2724,8 @@
      },
      "type": "array"
     },
-    "signature_algorithm": {
-     "description": "SignatureAlgorithm is the RSA algorithm used to sign JWT token. Only used if\nGrantType is set to \"urn:ietf:params:oauth:grant-type:jwt-bearer\".\nDefault value is RS256 and valid values RS256, RS384, RS512",
-     "type": "string"
+    "tls_config": {
+     "$ref": "#/definitions/TLSConfig"
     },
     "token_url": {
      "type": "string"
@@ -2918,7 +2907,7 @@
      "type": "string"
     }
    },
-   "title": "PagerdutyImage is an image.",
+   "title": "PagerdutyImage is an image attached to an incident.",
    "type": "object"
   },
   "PagerdutyLink": {
@@ -2930,7 +2919,7 @@
      "type": "string"
     }
    },
-   "title": "PagerdutyLink is a link.",
+   "title": "PagerdutyLink is used to add link to an incident.",
    "type": "object"
   },
   "PermissionDenied": {
@@ -2995,13 +2984,13 @@
    "properties": {
     "discord_configs": {
      "items": {
-      "$ref": "#/definitions/DiscordConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "email_configs": {
      "items": {
-      "$ref": "#/definitions/EmailConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
@@ -3013,19 +3002,19 @@
     },
     "jira_configs": {
      "items": {
-      "$ref": "#/definitions/JiraConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "msteams_configs": {
      "items": {
-      "$ref": "#/definitions/MSTeamsConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "msteamsv2_configs": {
      "items": {
-      "$ref": "#/definitions/MSTeamsV2Config"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
@@ -3035,61 +3024,61 @@
     },
     "opsgenie_configs": {
      "items": {
-      "$ref": "#/definitions/OpsGenieConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "pagerduty_configs": {
      "items": {
-      "$ref": "#/definitions/PagerdutyConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "pushover_configs": {
      "items": {
-      "$ref": "#/definitions/PushoverConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "slack_configs": {
      "items": {
-      "$ref": "#/definitions/SlackConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "sns_configs": {
      "items": {
-      "$ref": "#/definitions/SNSConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "telegram_configs": {
      "items": {
-      "$ref": "#/definitions/TelegramConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "victorops_configs": {
      "items": {
-      "$ref": "#/definitions/VictorOpsConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "webex_configs": {
      "items": {
-      "$ref": "#/definitions/WebexConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "webhook_configs": {
      "items": {
-      "$ref": "#/definitions/WebhookConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "wechat_configs": {
      "items": {
-      "$ref": "#/definitions/WechatConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     }
@@ -3601,6 +3590,7 @@
      "$ref": "#/definitions/URL"
     }
    },
+   "title": "ProxyConfig configures proxy settings.",
    "type": "object"
   },
   "ProxyHeader": {
@@ -3610,6 +3600,7 @@
     },
     "type": "array"
    },
+   "title": "ProxyHeader represents HTTP headers to send to proxies.",
    "type": "object"
   },
   "PublicError": {
@@ -3779,31 +3770,31 @@
    "properties": {
     "discord_configs": {
      "items": {
-      "$ref": "#/definitions/DiscordConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "email_configs": {
      "items": {
-      "$ref": "#/definitions/EmailConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "jira_configs": {
      "items": {
-      "$ref": "#/definitions/JiraConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "msteams_configs": {
      "items": {
-      "$ref": "#/definitions/MSTeamsConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "msteamsv2_configs": {
      "items": {
-      "$ref": "#/definitions/MSTeamsV2Config"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
@@ -3813,61 +3804,61 @@
     },
     "opsgenie_configs": {
      "items": {
-      "$ref": "#/definitions/OpsGenieConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "pagerduty_configs": {
      "items": {
-      "$ref": "#/definitions/PagerdutyConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "pushover_configs": {
      "items": {
-      "$ref": "#/definitions/PushoverConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "slack_configs": {
      "items": {
-      "$ref": "#/definitions/SlackConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "sns_configs": {
      "items": {
-      "$ref": "#/definitions/SNSConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "telegram_configs": {
      "items": {
-      "$ref": "#/definitions/TelegramConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "victorops_configs": {
      "items": {
-      "$ref": "#/definitions/VictorOpsConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "webex_configs": {
      "items": {
-      "$ref": "#/definitions/WebexConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "webhook_configs": {
      "items": {
-      "$ref": "#/definitions/WebhookConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     },
     "wechat_configs": {
      "items": {
-      "$ref": "#/definitions/WechatConfig"
+      "$ref": "#/definitions/Config"
      },
      "type": "array"
     }
@@ -3965,6 +3956,25 @@
   "RemoteWriteConfig": {
    "properties": {
     "url": {
+     "type": "string"
+    }
+   },
+   "type": "object"
+  },
+  "Responder": {
+   "properties": {
+    "id": {
+     "description": "One of those 3 should be filled.",
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "type": {
+     "description": "team, user, escalation, schedule etc.",
+     "type": "string"
+    },
+    "username": {
      "type": "string"
     }
    },
@@ -4366,7 +4376,7 @@
    "type": "object"
   },
   "Secret": {
-   "title": "Secret special type for storing secrets.",
+   "title": "Secret is a string that must not be revealed on marshaling.",
    "type": "string"
   },
   "SecretURL": {
@@ -4933,7 +4943,7 @@
      "$ref": "#/definitions/Userinfo"
     }
    },
-   "title": "URL is a custom URL type that allows validation at configuration load time.",
+   "title": "URL is a custom type that represents an HTTP or HTTPS URL and allows validation at configuration load time.",
    "type": "object"
   },
   "UpdateNamespaceRulesRequest": {
